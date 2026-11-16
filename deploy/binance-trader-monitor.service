@@ -1,0 +1,17 @@
+[Unit]
+Description=Binance Futures Copy Trader Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/binance-trader-monitor
+EnvironmentFile=/opt/binance-trader-monitor/.env
+ExecStart=/opt/binance-trader-monitor/.venv/bin/python /opt/binance-trader-monitor/run.py
+Restart=always
+RestartSec=5
+User=monitor
+Group=monitor
+
+[Install]
+WantedBy=multi-user.target
