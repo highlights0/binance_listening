@@ -320,6 +320,10 @@ class MirrorEngine:
             if source.identity_quality == "MISSING_TIME":
                 intent_status = "BLOCKED_MISSING_ORDER_TIME"
                 reason = "订单缺少稳定 orderTime，无法构造可靠的合成订单标识"
+                MirrorStore._set_meta(conn, "source_sync_status", "UNSYNCED")
+                MirrorStore._set_meta(conn, "source_sync_note", reason)
+                MirrorStore._set_meta(conn, "mirror_sync_status", "UNSYNCED")
+                MirrorStore._set_meta(conn, "mirror_sync_note", reason)
             elif sync_status != "SYNCED":
                 intent_status = "BLOCKED_SOURCE_UNSYNCED"
                 reason = "熬鹰源仓位没有可信基准；当前事件只记录，不更新镜像仓位"
@@ -390,6 +394,8 @@ class MirrorEngine:
                     reason = "收到减仓信号，但源账本没有对应的已知持仓"
                     MirrorStore._set_meta(conn, "source_sync_status", "UNSYNCED")
                     MirrorStore._set_meta(conn, "source_sync_note", reason)
+                    MirrorStore._set_meta(conn, "mirror_sync_status", "UNSYNCED")
+                    MirrorStore._set_meta(conn, "mirror_sync_note", reason)
                 elif source.quantity > source_qty_before:
                     intent_status = "BLOCKED_SOURCE_QTY_UNDERFLOW"
                     reason = (
@@ -398,6 +404,8 @@ class MirrorEngine:
                     )
                     MirrorStore._set_meta(conn, "source_sync_status", "UNSYNCED")
                     MirrorStore._set_meta(conn, "source_sync_note", reason)
+                    MirrorStore._set_meta(conn, "mirror_sync_status", "UNSYNCED")
+                    MirrorStore._set_meta(conn, "mirror_sync_note", reason)
                 else:
                     ratio = source.quantity / source_qty_before
                     source_qty_after = max(ZERO, source_qty_before - source.quantity)
@@ -412,6 +420,11 @@ class MirrorEngine:
                     if mirror_sync_status != "SYNCED":
                         intent_status = "BLOCKED_MIRROR_UNSYNCED"
                         reason = MirrorStore._get_meta(conn, "mirror_sync_note") or "镜像账本状态不一致"
+                    elif signal_time > _now_ms() + 30_000:
+                        intent_status = "BLOCKED_FUTURE_SIGNAL"
+                        reason = "减仓信号时间超前于服务器时间"
+                        MirrorStore._set_meta(conn, "mirror_sync_status", "UNSYNCED")
+                        MirrorStore._set_meta(conn, "mirror_sync_note", reason)
                     elif signal_age > self.config.max_signal_age_seconds:
                         intent_status = "BLOCKED_STALE_SIGNAL"
                         reason = f"减仓信号已延迟 {signal_age} 秒，超过限制"
