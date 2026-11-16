@@ -16,6 +16,10 @@ from .config import Settings
 from .database import Database
 from .email_notifier import EmailNotifier
 from .service import MonitorService
+from mirror.config import MirrorConfig
+from mirror.engine import MirrorEngine
+from mirror.market_data import FuturesMarketData
+from mirror.store import MirrorStore
 
 
 settings = Settings.from_env()
@@ -31,7 +35,19 @@ binance = BinanceCopyTradingClient(
     timeout_seconds=settings.binance_timeout_seconds,
 )
 notifier = EmailNotifier(settings)
-service = MonitorService(settings, database, binance, notifier)
+
+# Phase 1 is simulation-only. This market-data client has public read-only
+# methods; no Futures trading client or API credentials are instantiated.
+mirror_config = MirrorConfig.from_env()
+mirror_store = MirrorStore(settings.database_path)
+mirror_market_data = FuturesMarketData(
+    mirror_config.market_data_base_url,
+    mirror_config.market_data_timeout_seconds,
+)
+mirror_engine = MirrorEngine(mirror_store, mirror_market_data, mirror_config)
+service = MonitorService(
+    settings, database, binance, notifier, mirror_engine=mirror_engine
+)
 
 
 class EmailRequest(BaseModel):
@@ -64,7 +80,7 @@ async def check_status_token(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = __import__("asyncio").create_task(service.run())
+    task = asyncio.create_task(service.run())
     app.state.monitor_task = task
     yield
     service.stop()
@@ -73,9 +89,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Binance Trader Monitor",
-    description="熬鹰资本 Binance Futures Copy Trading 最新订单监听服务",
-    version="0.1.0",
-    lifespan=lifespan,
+    description="熬鹰资本 Binance Futures Copy Trading 监控与 Phase 1 虚拟镜像模拟",
+    version="0.2.0",
 )
 
 
@@ -103,6 +118,32 @@ async def api_status():
 @app.get("/api/events", dependencies=[Depends(check_status_token)])
 async def api_events(limit: int = Query(default=20, ge=1, le=100)):
     items = database.recent_orders(limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/mirror/status", dependencies=[Depends(check_status_token)])
+async def api_mirror_status():
+    return mirror_engine.status()
+
+
+@app.get("/api/mirror/positions", dependencies=[Depends(check_status_token)])
+async def api_mirror_positions():
+    return {
+        "source_sync_status": mirror_store.get_meta("source_sync_status", "UNSYNCED"),
+        "source_positions": mirror_store.source_positions(),
+        "mirror_positions": mirror_store.mirror_positions(),
+    }
+
+
+@app.get("/api/mirror/events", dependencies=[Depends(check_status_token)])
+async def api_mirror_events(limit: int = Query(default=50, ge=1, le=200)):
+    items = mirror_store.recent_events(limit)
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/mirror/intents", dependencies=[Depends(check_status_token)])
+async def api_mirror_intents(limit: int = Query(default=50, ge=1, le=200)):
+    items = mirror_store.recent_intents(limit)
     return {"items": items, "count": len(items)}
 
 

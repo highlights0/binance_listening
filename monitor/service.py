@@ -5,11 +5,12 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from .binance_client import BinanceAPIError, BinanceCopyTradingClient
+from .binance_client import BinanceCopyTradingClient
 from .config import Settings
 from .database import Database
 from .email_notifier import EmailNotifier
 from .events import order_fingerprint
+from mirror.engine import MirrorEngine
 
 
 class MonitorService:
@@ -19,11 +20,13 @@ class MonitorService:
         database: Database,
         binance: BinanceCopyTradingClient,
         notifier: EmailNotifier,
+        mirror_engine: MirrorEngine | None = None,
     ) -> None:
         self.settings = settings
         self.database = database
         self.binance = binance
         self.notifier = notifier
+        self.mirror_engine = mirror_engine
         self.log = logging.getLogger("monitor.service")
         self._stop = asyncio.Event()
         self._runtime: dict[str, Any] = {
@@ -32,6 +35,7 @@ class MonitorService:
             "last_fetch_pages": 0,
             "last_reported_total": None,
             "last_new_order_count": 0,
+            "last_mirror_processed_count": 0,
         }
 
     def stop(self) -> None:
@@ -45,6 +49,7 @@ class MonitorService:
             "page_size": self.settings.page_size,
             "lookback_days": self.settings.lookback_days,
             "email_enabled": self.settings.email_enabled,
+            "mirror": self.mirror_engine.status() if self.mirror_engine else None,
             **self._runtime,
             **self.database.status_snapshot(),
         }
@@ -61,6 +66,10 @@ class MonitorService:
         if not self.settings.email_enabled:
             self.log.warning(
                 "SMTP 尚未配置：新订单会保存到数据库，但不会发送邮件。"
+            )
+        if self.mirror_engine:
+            self.log.warning(
+                "Phase 1 镜像引擎处于 SIMULATION_ONLY；不会连接或调用任何真实下单接口。"
             )
 
         failure_count = 0
@@ -99,7 +108,15 @@ class MonitorService:
         finally:
             self._runtime["running"] = False
             await self.binance.close()
+            if self.mirror_engine:
+                await self.mirror_engine.close()
             self.log.info("监听服务已停止")
+
+    async def _process_mirror_queue(self) -> None:
+        if not self.mirror_engine:
+            return
+        processed = await self.mirror_engine.process_pending_source_orders()
+        self._runtime["last_mirror_processed_count"] = processed
 
     async def _poll_once(self) -> None:
         now = datetime.now(timezone.utc).isoformat()
@@ -128,6 +145,8 @@ class MonitorService:
                 len(rows),
                 inserted,
             )
+            # Baseline rows are deliberately excluded from mirror processing.
+            await self._process_mirror_queue()
             return
 
         known = self.database.get_known_fingerprints()
@@ -155,6 +174,9 @@ class MonitorService:
                 len(inserted_fingerprints),
             )
 
+        # The mirror store scans the durable orders table, so an interrupted
+        # process can resume events that were inserted but not yet simulated.
+        await self._process_mirror_queue()
         await self._send_pending_email()
 
     async def _send_pending_email(self) -> None:
