@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -70,6 +71,124 @@ class Database:
                     value TEXT
                 )
                 """
+            )
+            conn.execute("""CREATE TABLE IF NOT EXISTS subscribers (
+                email TEXT PRIMARY KEY,
+                token TEXT NOT NULL UNIQUE,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                requested_at TEXT NOT NULL
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS deliveries (
+                email TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                attempt_at TEXT,
+                sent_at TEXT,
+                PRIMARY KEY (email, fingerprint)
+            )""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS unsubscribe_requests (
+                email TEXT PRIMARY KEY,
+                requested_at TEXT NOT NULL
+            )""")
+            conn.commit()
+
+    def request_subscription(self, email: str) -> str | None:
+        now = self._now()
+        cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - 3600, tz=timezone.utc
+        ).isoformat()
+        with self.connect() as conn:
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM subscribers WHERE requested_at > ?", (cutoff,)
+            ).fetchone()[0]
+            row = conn.execute(
+                "SELECT confirmed, requested_at FROM subscribers WHERE email=?", (email,)
+            ).fetchone()
+            if row and (row["confirmed"] or row["requested_at"] > cutoff):
+                return None
+            if recent >= 20:
+                return None
+            token = secrets.token_urlsafe(32)
+            conn.execute("""INSERT INTO subscribers(email, token, requested_at)
+                VALUES(?, ?, ?) ON CONFLICT(email) DO UPDATE SET
+                token=excluded.token, requested_at=excluded.requested_at""",
+                (email, token, now))
+            conn.commit()
+            return token
+
+    def confirm_subscription(self, token: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "UPDATE subscribers SET confirmed=1 WHERE token=? AND confirmed=0",
+                (token,))
+            conn.commit()
+            return cursor.rowcount == 1
+
+    def unsubscribe(self, token: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute("SELECT email FROM subscribers WHERE token=?", (token,)).fetchone()
+            if not row:
+                return False
+            conn.execute("DELETE FROM deliveries WHERE email=?", (row["email"],))
+            conn.execute("DELETE FROM unsubscribe_requests WHERE email=?", (row["email"],))
+            conn.execute("DELETE FROM subscribers WHERE email=?", (row["email"],))
+            conn.commit()
+            return True
+
+    def request_unsubscribe(self, email: str) -> str | None:
+        cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - 3600, tz=timezone.utc
+        ).isoformat()
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT token FROM subscribers WHERE email=? AND confirmed=1", (email,)
+            ).fetchone()
+            recent = conn.execute(
+                "SELECT COUNT(*) FROM unsubscribe_requests WHERE requested_at > ?", (cutoff,)
+            ).fetchone()[0]
+            previous = conn.execute(
+                "SELECT requested_at FROM unsubscribe_requests WHERE email=?", (email,)
+            ).fetchone()
+            if not row or recent >= 20 or (previous and previous["requested_at"] > cutoff):
+                return None
+            conn.execute("""INSERT INTO unsubscribe_requests(email, requested_at)
+                VALUES(?, ?) ON CONFLICT(email) DO UPDATE SET requested_at=excluded.requested_at""",
+                (email, self._now()))
+            conn.commit()
+            return row["token"]
+
+    def cancel_unsubscribe_request(self, email: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM unsubscribe_requests WHERE email=?", (email,))
+            conn.commit()
+
+    def subscriber_token(self, email: str) -> str | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT token FROM subscribers WHERE email=? AND confirmed=1", (email,)
+            ).fetchone()
+            return row["token"] if row else None
+
+    def pending_subscriber_notifications(self) -> dict[str, list[dict[str, Any]]]:
+        cutoff = datetime.fromtimestamp(
+            datetime.now(timezone.utc).timestamp() - 60, tz=timezone.utc
+        ).isoformat()
+        with self.connect() as conn:
+            rows = conn.execute("""SELECT d.email, o.* FROM deliveries d
+                JOIN orders o ON o.fingerprint=d.fingerprint
+                WHERE d.sent_at IS NULL AND (d.attempt_at IS NULL OR d.attempt_at < ?)
+                ORDER BY o.order_time_ms ASC LIMIT 200""", (cutoff,)).fetchall()
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            item = dict(row)
+            grouped.setdefault(item.pop("email"), []).append(item)
+        return grouped
+
+    def mark_subscriber_delivery(self, email: str, fingerprints: list[str], sent: bool) -> None:
+        now = self._now()
+        with self.connect() as conn:
+            conn.executemany(
+                "UPDATE deliveries SET attempt_at=?, sent_at=? WHERE email=? AND fingerprint=?",
+                [(now, now if sent else None, email, fp) for fp in fingerprints],
             )
             conn.commit()
 
@@ -174,6 +293,8 @@ class Database:
                 fp = order_fingerprint(row)
                 if self._insert_order(conn, row, "pending"):
                     inserted_fingerprints.append(fp)
+                    conn.execute("""INSERT INTO deliveries(email, fingerprint)
+                        SELECT email, ? FROM subscribers WHERE confirmed=1""", (fp,))
             conn.commit()
         self.prune()
         return inserted_fingerprints
@@ -278,13 +399,19 @@ class Database:
             conn.execute(
                 """DELETE FROM orders
                    WHERE order_time_ms < ?
-                     AND notification_status != 'pending'""",
+                     AND notification_status != 'pending'
+                     AND fingerprint NOT IN (
+                       SELECT fingerprint FROM deliveries WHERE sent_at IS NULL
+                     )""",
                 (cutoff_ms,),
             )
             conn.execute(
                 """
                 DELETE FROM orders
                 WHERE notification_status != 'pending'
+                  AND fingerprint NOT IN (
+                    SELECT fingerprint FROM deliveries WHERE sent_at IS NULL
+                  )
                   AND fingerprint NOT IN (
                     SELECT fingerprint FROM orders
                     ORDER BY order_time_ms DESC
@@ -293,6 +420,7 @@ class Database:
                 """,
                 (self.keep_event_count,),
             )
+            conn.execute("DELETE FROM deliveries WHERE fingerprint NOT IN (SELECT fingerprint FROM orders)")
             conn.commit()
 
     def status_snapshot(self) -> dict[str, Any]:

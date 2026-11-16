@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>熬鹰资本 · 带单监控</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #e9eef5; background: #0e1520; }
+    body { max-width: 1100px; margin: auto; padding: 28px 18px; }
+    h1 { margin: 0 0 6px; font-size: 26px; }
+    .muted { color: #9baabd; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 26px 0; }
+    .card, .panel { background: #172231; border: 1px solid #2a394b; border-radius: 12px; padding: 18px; }
+    .card strong { display: block; margin-top: 10px; font-size: 20px; }
+    .good { color: #65d8a5; } .bad { color: #ff9d94; }
+    .panel { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; white-space: nowrap; }
+    th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #2a394b; }
+    th { color: #9baabd; font-weight: 500; }
+    tr:last-child td { border-bottom: 0; }
+    #error { min-height: 1.4em; }
+    input, button { font: inherit; padding: 10px 12px; border-radius: 8px; }
+    input { background: #0e1520; border: 1px solid #526176; color: #e9eef5; width: min(100%, 320px); box-sizing: border-box; }
+    button { background: #65d8a5; border: 0; color: #0e1520; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+  </style>
+</head>
+<body>
+  <h1>熬鹰资本 · 带单监控</h1>
+  <div class="muted">Binance 合约公开订单 · 每 5 秒自动刷新</div>
+  <div class="grid">
+    <div class="card">运行状态<strong id="state">读取中</strong></div>
+    <div class="card">最近成功轮询<strong id="last">—</strong></div>
+    <div class="card">已记录订单<strong id="count">—</strong></div>
+    <div class="card">邮件服务<strong id="email">—</strong></div>
+  </div>
+  <div class="panel">
+    <h2>订阅邮件通知</h2>
+    <p class="muted">填写邮箱订阅新订单通知，或申请退订。两种操作都需要在邮件中确认。</p>
+    <form id="subscribe-form">
+      <input id="address" type="email" maxlength="254" placeholder="你的邮箱地址" aria-label="你的邮箱地址" required>
+      <button type="submit">发送确认邮件</button>
+      <button id="unsubscribe-request" type="button">退订通知</button>
+    </form>
+    <button id="link-action" type="button" hidden></button>
+    <p id="subscribe-message" aria-live="polite"></p>
+  </div>
+  <p id="error" class="bad"></p>
+  <div class="panel">
+    <h2>最近订单</h2>
+    <table>
+      <thead><tr><th>时间</th><th>交易对</th><th>方向</th><th>数量</th><th>均价</th><th>盈亏</th></tr></thead>
+      <tbody id="orders"><tr><td colspan="6" class="muted">读取中…</td></tr></tbody>
+    </table>
+  </div>
+  <script>
+    const $ = id => document.getElementById(id);
+    async function post(url, body) {
+      const response = await fetch(url, {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.detail || '请求失败');
+      return data.message;
+    }
+    $('subscribe-form').addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = event.target.querySelector('button');
+      button.disabled = true;
+      try {
+        $('subscribe-message').textContent = await post('/api/subscribe', {email: $('address').value});
+      } catch (error) {
+        $('subscribe-message').textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+    $('unsubscribe-request').addEventListener('click', async event => {
+      if (!$('address').reportValidity()) return;
+      const button = event.target;
+      button.disabled = true;
+      try {
+        $('subscribe-message').textContent = await post('/api/subscribe/unsubscribe-request', {email: $('address').value});
+      } catch (error) {
+        $('subscribe-message').textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+    const params = new URLSearchParams(location.search);
+    const action = params.has('confirm') ? 'confirm' : params.has('unsubscribe') ? 'unsubscribe' : null;
+    if (action) {
+      const button = $('link-action');
+      button.hidden = false;
+      button.textContent = action === 'confirm' ? '确认订阅' : '确认退订';
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          $('subscribe-message').textContent = await post('/api/subscribe/' + action, {token: params.get(action)});
+          button.hidden = true;
+          history.replaceState(null, '', '/');
+        } catch (error) {
+          $('subscribe-message').textContent = error.message;
+          button.disabled = false;
+        }
+      });
+    }
+    async function refresh() {
+      try {
+        const [statusResponse, eventsResponse] = await Promise.all([
+          fetch('/api/status'), fetch('/api/events?limit=50')
+        ]);
+        if (!statusResponse.ok || !eventsResponse.ok) throw new Error('状态接口不可用');
+        const status = await statusResponse.json();
+        const events = await eventsResponse.json();
+        $('state').textContent = status.running && !status.last_error ? '运行正常' : '异常';
+        $('state').className = status.running && !status.last_error ? 'good' : 'bad';
+        $('last').textContent = status.last_success_at ? new Date(status.last_success_at).toLocaleString('zh-CN') : '尚未成功';
+        $('count').textContent = status.stored_order_count;
+        $('email').textContent = status.email_enabled ? '已开启' : '未配置';
+        $('error').textContent = status.last_error || '';
+        const rows = events.items.map(order => {
+          const tr = document.createElement('tr');
+          const values = [order.order_time_text, order.symbol, order.direction,
+            order.executed_qty, order.avg_price, order.total_pnl];
+          for (const value of values) {
+            const td = document.createElement('td');
+            td.textContent = value ?? '—';
+            tr.append(td);
+          }
+          return tr;
+        });
+        $('orders').replaceChildren(...rows);
+        if (!rows.length) $('orders').innerHTML = '<tr><td colspan="6" class="muted">暂无订单</td></tr>';
+      } catch (error) {
+        $('state').textContent = '连接失败';
+        $('state').className = 'bad';
+        $('error').textContent = error.message;
+      }
+    }
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

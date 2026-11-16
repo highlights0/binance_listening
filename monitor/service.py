@@ -162,24 +162,34 @@ class MonitorService:
             return
 
         pending = self.database.get_pending_notifications()
-        if not pending:
-            return
+        if pending:
+            fingerprints = [row["fingerprint"] for row in pending]
+            try:
+                await asyncio.to_thread(self.notifier.send_orders, pending)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self.database.mark_notification_attempt(fingerprints, error)
+                self.database.set_state("last_email_error", error)
+                self.log.exception("邮件发送失败，订单保留待重试：%s", error)
+            else:
+                self.database.mark_notification_sent(fingerprints)
+                self.database.set_state("last_email_at", datetime.now(timezone.utc).isoformat())
+                self.database.set_state("last_email_error", "")
+                self.log.info("邮件发送成功：%s 条新订单", len(pending))
 
-        fingerprints = [row["fingerprint"] for row in pending]
-        try:
-            await asyncio.to_thread(self.notifier.send_orders, pending)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            self.database.mark_notification_attempt(fingerprints, error)
-            self.database.set_state("last_email_error", error)
-            self.log.exception(
-                "邮件发送失败，订单保留待重试：%s",
-                error,
-            )
-            return
-
-        self.database.mark_notification_sent(fingerprints)
-        now = datetime.now(timezone.utc).isoformat()
-        self.database.set_state("last_email_at", now)
-        self.database.set_state("last_email_error", "")
-        self.log.info("邮件发送成功：%s 条新订单", len(pending))
+        for email, rows in self.database.pending_subscriber_notifications().items():
+            token = self.database.subscriber_token(email)
+            if not token:
+                continue
+            fingerprints = [row["fingerprint"] for row in rows]
+            try:
+                await asyncio.to_thread(
+                    self.notifier.send_orders, rows, email,
+                    f"{self.settings.public_base_url}/?unsubscribe={token}",
+                )
+            except Exception as exc:
+                self.database.mark_subscriber_delivery(email, fingerprints, False)
+                self.log.exception("订阅者邮件发送失败：%s", exc)
+            else:
+                self.database.mark_subscriber_delivery(email, fingerprints, True)
+                self.log.info("订阅者邮件发送成功：%s 条新订单", len(rows))

@@ -14,7 +14,10 @@ class EmailNotifier:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    def send_orders(self, rows: list[dict[str, Any]]) -> None:
+    def send_orders(
+        self, rows: list[dict[str, Any]], recipient: str | None = None,
+        unsubscribe_url: str | None = None,
+    ) -> None:
         if not self.settings.email_enabled:
             raise RuntimeError(
                 "SMTP 未配置：请在 .env 中填写 SMTP_HOST、MAIL_FROM、MAIL_TO"
@@ -80,6 +83,12 @@ class EmailNotifier:
             )
 
         text_body = "\n".join(text_lines)
+        if unsubscribe_url:
+            text_body += f"\n退订通知：{unsubscribe_url}\n"
+        unsubscribe_html = (
+            f'<p><a href="{html.escape(unsubscribe_url, quote=True)}">退订通知</a></p>'
+            if unsubscribe_url else ""
+        )
         html_body = f"""
         <html><body style="font-family:Arial,'Microsoft YaHei',sans-serif">
           <h2>{html.escape(self.settings.trader_name)}：发现新交易记录</h2>
@@ -99,16 +108,36 @@ class EmailNotifier:
           <p><a href="{html.escape(
               self.settings.binance_referer, quote=True
           )}">打开币安带单员主页</a></p>
+          {unsubscribe_html}
         </body></html>
         """
 
         message = EmailMessage()
         message["Subject"] = subject
         message["From"] = self.settings.mail_from
-        message["To"] = self.settings.mail_to
+        message["To"] = recipient or self.settings.mail_to
         message.set_content(text_body)
         message.add_alternative(html_body, subtype="html")
 
+        self._send(message)
+
+    def send_confirmation(self, recipient: str, url: str) -> None:
+        message = EmailMessage()
+        message["Subject"] = f"{self.settings.mail_subject_prefix} 确认邮件订阅"
+        message["From"] = self.settings.mail_from
+        message["To"] = recipient
+        message.set_content(f"请打开以下链接并确认订阅：\n{url}\n\n如果不是你操作，请忽略此邮件。")
+        self._send(message)
+
+    def send_unsubscribe(self, recipient: str, url: str) -> None:
+        message = EmailMessage()
+        message["Subject"] = f"{self.settings.mail_subject_prefix} 退订邮件通知"
+        message["From"] = self.settings.mail_from
+        message["To"] = recipient
+        message.set_content(f"请打开以下链接并确认退订：\n{url}\n\n如果不是你操作，请忽略此邮件。")
+        self._send(message)
+
+    def _send(self, message: EmailMessage) -> None:
         security = self.settings.smtp_security
         if security == "ssl":
             context = ssl.create_default_context()
@@ -119,7 +148,7 @@ class EmailNotifier:
                 context=context,
             ) as server:
                 self._login_if_needed(server)
-                server.send_message(message)
+                refused = server.send_message(message)
         elif security == "starttls":
             with smtplib.SMTP(
                 self.settings.smtp_host,
@@ -130,7 +159,7 @@ class EmailNotifier:
                 server.starttls(context=ssl.create_default_context())
                 server.ehlo()
                 self._login_if_needed(server)
-                server.send_message(message)
+                refused = server.send_message(message)
         elif security == "none":
             with smtplib.SMTP(
                 self.settings.smtp_host,
@@ -138,11 +167,13 @@ class EmailNotifier:
                 timeout=20,
             ) as server:
                 self._login_if_needed(server)
-                server.send_message(message)
+                refused = server.send_message(message)
         else:
             raise RuntimeError(
                 "SMTP_SECURITY 仅支持 ssl、starttls、none"
             )
+        if refused:
+            raise smtplib.SMTPRecipientsRefused(refused)
 
     def _login_if_needed(self, server: smtplib.SMTP) -> None:
         if self.settings.smtp_username:

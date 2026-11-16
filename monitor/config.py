@@ -52,6 +52,7 @@ class Settings:
     api_host: str
     api_port: int
     status_api_token: str
+    public_base_url: str
 
     log_level: str
     timezone: str
@@ -118,6 +119,7 @@ class Settings:
             status_api_token=os.getenv(
                 "STATUS_API_TOKEN", ""
             ).strip(),
+            public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/"),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             timezone=os.getenv("TIMEZONE", "Asia/Shanghai").strip(),
         )
