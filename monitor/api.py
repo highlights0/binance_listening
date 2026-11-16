@@ -91,6 +91,7 @@ app = FastAPI(
     title="Binance Trader Monitor",
     description="熬鹰资本 Binance Futures Copy Trading 监控与 Phase 1 虚拟镜像模拟",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 
