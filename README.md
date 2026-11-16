@@ -191,3 +191,78 @@ python run.py
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+
+## 10. Phase 1：个人 USDⓈ-M 虚拟镜像模拟
+
+Phase 1 只构建虚拟账本和模拟意图，**不连接真实 Futures 账户、不读取 API Key/Secret、不提交真实订单**。
+
+### 配置
+
+在 `.env` 中调整：
+
+```dotenv
+MIRROR_ENABLED=true
+MIRROR_FIXED_MARGIN_USDT=10
+MIRROR_LEVERAGE=3
+MIRROR_MAX_ORDER_MARGIN_USDT=10
+MIRROR_MAX_TOTAL_MARGIN_USDT=50
+MIRROR_MAX_SYMBOL_MARGIN_USDT=20
+MIRROR_MAX_PRICE_DEVIATION_BPS=50
+MIRROR_MAX_SIGNAL_AGE_SECONDS=120
+MIRROR_MAX_DAILY_LOSS_USDT=10
+MIRROR_ALLOWED_SYMBOLS=
+MIRROR_MARKET_DATA_BASE_URL=https://fapi.binance.com
+```
+
+以上均为开发/模拟默认值，不是实盘建议。固定保证金按每条被识别为开仓/加仓的源订单计算；目标数量使用当前标记价格和 USDⓈ-M `exchangeInfo` 过滤规则计算。
+
+### 源仓位同步前置条件
+
+熬鹰公开页面隐藏了当前仓位，当前持仓接口返回空数组。因此，程序默认将源仓位标记为 `UNSYNCED`：
+
+- `UNSYNCED` 时只生成被阻止的模拟预览，不更新镜像仓位。
+- 只有获得可信的完整源仓位基准后，才能进行减仓比例模拟。
+- 不要仅因为公开持仓接口返回空数组，就认定熬鹰当前仓位为空。
+- 如果你能独立确认熬鹰所有仓位确实为空，可以显式初始化为平仓基准：
+
+```bash
+python -m mirror.cli --database ./data/monitor.db assume-source-flat --confirm-source-is-flat
+```
+
+如果源账户实际仍有仓位，应导入一份完整快照，而不是假设为空。JSON 示例：
+
+```json
+[
+  {"symbol":"BTCUSDT","side":"LONG","quantity":"0.015","avg_entry_price":"65000"},
+  {"symbol":"ETHUSDT","side":"SHORT","quantity":"0.25","avg_entry_price":"3200"}
+]
+```
+
+导入命令：
+
+```bash
+python -m mirror.cli --database ./data/monitor.db seed-source-positions --file source_positions.json --confirm-complete-snapshot
+```
+
+这两个命令只修改本地模拟账本，不会访问或修改币安账户。导入快照必须覆盖源账户全部未平仓 LONG/SHORT 仓位；遗漏仓位会导致后续减仓比例错误。
+
+### 模拟 API
+
+默认状态 API 仍绑定本机 `127.0.0.1:8765`。镜像接口也受 `STATUS_API_TOKEN` 保护（如果配置了该 token）：
+
+- `GET /api/mirror/status`：模拟模式、源同步状态、风险参数、计数。
+- `GET /api/mirror/positions`：源虚拟仓位和目标模拟仓位。
+- `GET /api/mirror/events?limit=50`：源订单事件处理结果。
+- `GET /api/mirror/intents?limit=50`：模拟开仓/减仓意图及阻止原因。
+
+### Phase 1 的明确限制
+
+1. 币安公开订单行没有独立 `orderId` / `tradeId`。当前使用 `symbol + side + positionSide + type + orderTime` 构造合成订单键；同键出现不同快照时标记身份歧义并暂停同步，不能声称逐笔成交级别完全可靠。
+2. 目前只处理 `positionSide=LONG/SHORT`。`BOTH`、缺少稳定 `orderTime` 的记录会被阻止。
+3. 仅凭订单历史无法证明某一条记录是首次开仓还是加仓，因此事件使用 `OPEN_OR_ADD`、`REDUCE_OR_CLOSE` 这样的保守分类。
+4. 源仓位基准未同步、源仓位数量下溢、订单身份歧义或镜像账本异常时，系统会 fail-closed，不生成可执行的模拟仓位变更。
+5. 开仓按固定保证金和配置杠杆计算数量；减仓按源仓位减仓比例计算目标模拟仓位的减仓量。
+6. 标记价格和数量规则来自 USDⓈ-M 公共只读接口；接口不可用时对应模拟意图会被阻止。
+7. 本阶段没有真实下单代码。Phase 2 才会单独设计 API Key 管理、用户数据流和 Demo/Testnet 验证；实盘功能不会因修改配置而自动开启。
+
